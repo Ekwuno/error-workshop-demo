@@ -28,8 +28,17 @@
 //     -d '{"messages":[{"to":"+44700000001","body":"Hello"},{"to":"not-a-number","body":"Hi"}]}' | jq
 //
 // ─────────────────────────────────────────────────────────────
-const express = require("express");
-const crypto = require("crypto");
+import express, { Request, Response, NextFunction } from "express";
+import crypto from "crypto";
+
+// Extend Express Request with our custom properties
+declare module "express" {
+  interface Request {
+    id: string;
+    apiKey?: string;
+  }
+}
+
 const app = express();
 app.use(express.json());
 
@@ -39,7 +48,23 @@ app.use(express.json());
 // Every error code lives here. One file, one source of truth.
 // Exposed as GET /errors so developers and SDKs can fetch it.
 // ═════════════════════════════════════════════════════════════
-const ERROR_CATALOG = {
+interface CatalogEntry {
+  status: number;
+  message: string;
+  hint: string;
+}
+
+type ErrorCode =
+  | "AUTH_MISSING"
+  | "AUTH_INVALID"
+  | "VALIDATION_FAILED"
+  | "RATE_LIMIT_EXCEEDED"
+  | "VERSION_CONFLICT"
+  | "RESOURCE_NOT_FOUND"
+  | "DOWNSTREAM_TIMEOUT"
+  | "INTERNAL_ERROR";
+
+const ERROR_CATALOG: Record<ErrorCode, CatalogEntry> = {
   AUTH_MISSING: {
     status: 401,
     message: "API key is missing from the request.",
@@ -89,10 +114,21 @@ const ERROR_CATALOG = {
 // way through to the response. Middleware formats it, never
 // replaces it.
 // ═════════════════════════════════════════════════════════════
+interface ApiErrorOverrides {
+  message?: string;
+  status?: number;
+  hint?: string;
+  meta?: Record<string, unknown>;
+}
+
 class ApiError extends Error {
-  constructor(code, overrides = {}) {
+  code: ErrorCode;
+  status: number;
+  hint: string;
+  meta: Record<string, unknown>;
+
+  constructor(code: ErrorCode, overrides: ApiErrorOverrides = {}) {
     const catalog = ERROR_CATALOG[code];
-    if (!catalog) throw new Error(`Unknown error code: ${code}`);
     const message = overrides.message || catalog.message;
     super(message);
     this.code = code;
@@ -120,7 +156,7 @@ class ApiError extends Error {
 // Every request gets a unique ID. Returned in every response
 // (success or error) for log correlation and support tickets.
 // ═════════════════════════════════════════════════════════════
-app.use((req, res, next) => {
+app.use((req: Request, res: Response, next: NextFunction) => {
   req.id = `req_${crypto.randomBytes(8).toString("hex")}`;
   res.set("X-Request-Id", req.id);
   next();
@@ -134,7 +170,7 @@ app.use((req, res, next) => {
 // ═════════════════════════════════════════════════════════════
 const VALID_KEYS = ["sk-live-demo", "sk-test-demo"];
 
-function requireAuth(req, res, next) {
+function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const header = req.headers.authorization;
   if (!header) {
     return next(new ApiError("AUTH_MISSING"));
@@ -157,11 +193,16 @@ function requireAuth(req, res, next) {
 // Simple in-memory rate limiter. Returns machine-readable
 // fields so SDKs and agents can auto-recover.
 // ═════════════════════════════════════════════════════════════
-const rateBuckets = {};
+interface RateBucket {
+  start: number;
+  count: number;
+}
+
+const rateBuckets: Record<string, RateBucket> = {};
 const RATE_LIMIT = 10;
 const RATE_WINDOW_MS = 60_000;
 
-function rateLimit(req, res, next) {
+function rateLimit(req: Request, res: Response, next: NextFunction): void {
   const key = req.apiKey || "anonymous";
   const now = Date.now();
   if (!rateBuckets[key] || now - rateBuckets[key].start > RATE_WINDOW_MS) {
@@ -201,19 +242,22 @@ function rateLimit(req, res, next) {
 // ═════════════════════════════════════════════════════════════
 
 // --- GET /errors --- Error catalog endpoint -------------------
-app.get("/errors", (req, res) => {
-  const catalog = Object.entries(ERROR_CATALOG).map(([code, info]) => ({
-    code,
-    status: info.status,
-    message: info.message,
-    hint: info.hint,
-    docs_url: `http://localhost:3000/errors/${code}`,
-  }));
+app.get("/errors", (req: Request, res: Response) => {
+  const catalog = (Object.entries(ERROR_CATALOG) as [ErrorCode, CatalogEntry][]).map(
+    ([code, info]) => ({
+      code,
+      status: info.status,
+      message: info.message,
+      hint: info.hint,
+      docs_url: `http://localhost:3000/errors/${code}`,
+    })
+  );
   res.json({ errors: catalog, total: catalog.length });
 });
 
-app.get("/errors/:code", (req, res, next) => {
-  const info = ERROR_CATALOG[req.params.code];
+app.get("/errors/:code", (req: Request, res: Response, next: NextFunction) => {
+  const code = req.params.code as ErrorCode;
+  const info = ERROR_CATALOG[code];
   if (!info) {
     return next(
       new ApiError("RESOURCE_NOT_FOUND", {
@@ -223,11 +267,11 @@ app.get("/errors/:code", (req, res, next) => {
     );
   }
   res.json({
-    code: req.params.code,
+    code,
     status: info.status,
     message: info.message,
     hint: info.hint,
-    docs_url: `http://localhost:3000/errors/${req.params.code}`,
+    docs_url: `http://localhost:3000/errors/${code}`,
   });
 });
 
@@ -240,11 +284,28 @@ const VALID_EVENTS = [
   "payment.failed",
   "user.created",
   "user.deleted",
-];
+] as const;
 
-app.post("/webhooks", requireAuth, rateLimit, (req, res, next) => {
-  const { url, events, secret } = req.body || {};
-  const errors = [];
+type WebhookEvent = (typeof VALID_EVENTS)[number];
+
+interface WebhookBody {
+  url?: string;
+  events?: string[];
+  secret?: string;
+}
+
+interface FieldError {
+  field: string;
+  message: string;
+  rejected_value?: string;
+  rejected_values?: string[];
+  hint?: string;
+  available_events?: readonly string[];
+}
+
+app.post("/webhooks", requireAuth, rateLimit, (req: Request, res: Response, next: NextFunction) => {
+  const { url, events } = (req.body || {}) as WebhookBody;
+  const errors: FieldError[] = [];
 
   if (!url) {
     errors.push({ field: "url", message: "Required." });
@@ -268,7 +329,7 @@ app.post("/webhooks", requireAuth, rateLimit, (req, res, next) => {
       available_events: VALID_EVENTS,
     });
   } else {
-    const invalid = events.filter((e) => !VALID_EVENTS.includes(e));
+    const invalid = events.filter((e) => !(VALID_EVENTS as readonly string[]).includes(e));
     if (invalid.length > 0) {
       errors.push({
         field: "events",
@@ -297,7 +358,26 @@ app.post("/webhooks", requireAuth, rateLimit, (req, res, next) => {
 });
 
 // --- PATCH /configs/:id --- Optimistic locking ----------------
-const configs = {
+interface HistoryEntry {
+  version: number;
+  changed_fields: string[];
+  changed_by: string;
+  changed_at: string;
+}
+
+interface Config {
+  id: string;
+  version: number;
+  etag: string;
+  theme: string;
+  language: string;
+  updated_by: string;
+  updated_at: string;
+  history: HistoryEntry[];
+  [key: string]: unknown;
+}
+
+const configs: Record<string, Config> = {
   cfg_001: {
     id: "cfg_001",
     version: 4,
@@ -323,7 +403,7 @@ const configs = {
   },
 };
 
-app.get("/configs/:id", requireAuth, rateLimit, (req, res, next) => {
+app.get("/configs/:id", requireAuth, rateLimit, (req: Request, res: Response, next: NextFunction) => {
   const config = configs[req.params.id];
   if (!config) {
     return next(
@@ -337,7 +417,7 @@ app.get("/configs/:id", requireAuth, rateLimit, (req, res, next) => {
   res.json(config);
 });
 
-app.patch("/configs/:id", requireAuth, rateLimit, (req, res, next) => {
+app.patch("/configs/:id", requireAuth, rateLimit, (req: Request, res: Response, next: NextFunction) => {
   const config = configs[req.params.id];
   if (!config) {
     return next(
@@ -347,7 +427,7 @@ app.patch("/configs/:id", requireAuth, rateLimit, (req, res, next) => {
     );
   }
 
-  const clientEtag = req.headers["if-match"];
+  const clientEtag = req.headers["if-match"] as string | undefined;
   if (!clientEtag) {
     return next(
       new ApiError("VALIDATION_FAILED", {
@@ -395,7 +475,7 @@ app.patch("/configs/:id", requireAuth, rateLimit, (req, res, next) => {
 });
 
 // --- POST /documents/verify --- Downstream timeout ------------
-app.post("/documents/verify", requireAuth, rateLimit, (req, res, next) => {
+app.post("/documents/verify", requireAuth, rateLimit, (req: Request, res: Response, next: NextFunction) => {
   // Simulate a downstream timeout
   const shouldTimeout = Math.random() > 0.3; // 70% chance of timeout for demo
   if (shouldTimeout) {
@@ -423,8 +503,17 @@ app.post("/documents/verify", requireAuth, rateLimit, (req, res, next) => {
 });
 
 // --- POST /messages/batch --- Partial batch failure ------------
-app.post("/messages/batch", requireAuth, rateLimit, (req, res, next) => {
-  const { messages } = req.body || {};
+interface BatchMessage {
+  to?: string;
+  body?: string;
+}
+
+interface BatchBody {
+  messages?: BatchMessage[];
+}
+
+app.post("/messages/batch", requireAuth, rateLimit, (req: Request, res: Response, next: NextFunction) => {
+  const { messages } = (req.body || {}) as BatchBody;
   if (!messages || !Array.isArray(messages)) {
     return next(
       new ApiError("VALIDATION_FAILED", {
@@ -455,7 +544,7 @@ app.post("/messages/batch", requireAuth, rateLimit, (req, res, next) => {
 
   const E164_REGEX = /^\+[1-9]\d{6,14}$/;
   const results = messages.map((msg, index) => {
-    const itemErrors = [];
+    const itemErrors: FieldError[] = [];
     if (!msg.to) {
       itemErrors.push({ field: "to", message: "Required." });
     } else if (!E164_REGEX.test(msg.to)) {
@@ -473,20 +562,19 @@ app.post("/messages/batch", requireAuth, rateLimit, (req, res, next) => {
       itemErrors.push({
         field: "body",
         message: `Body length ${msg.body.length} exceeds maximum of 1600 characters.`,
-        max_length: 1600,
       });
     }
 
     if (itemErrors.length > 0) {
       return {
         index,
-        status: "failed",
+        status: "failed" as const,
         error: { code: "VALIDATION_FAILED", errors: itemErrors },
       };
     }
     return {
       index,
-      status: "sent",
+      status: "sent" as const,
       message_id: `msg_${crypto.randomBytes(4).toString("hex")}`,
       to: msg.to,
     };
@@ -512,7 +600,7 @@ app.post("/messages/batch", requireAuth, rateLimit, (req, res, next) => {
 // Formats ApiErrors cleanly. Catches unexpected errors safely.
 // Never swallows context. Always includes request_id.
 // ═════════════════════════════════════════════════════════════
-app.use((err, req, res, _next) => {
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
   if (err instanceof ApiError) {
     return res.status(err.status).json({
       ...err.toJSON(),

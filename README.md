@@ -125,10 +125,12 @@ Endpoints may add extra fields in the error object (e.g. `errors[]` for validati
 ## Project Structure
 
 ```
-server.js    -- The entire API in one file, heavily commented
+server.ts    -- The entire API in one file, heavily commented (TypeScript)
 ```
 
-Sections in `server.js`:
+Written in TypeScript, executed directly with [tsx](https://tsx.is/) -- no build step needed.
+
+Sections in `server.ts`:
 1. **Error Catalog** -- Single source of truth for all error codes
 2. **ApiError Class** -- Structured error that flows from origin to response
 3. **Request ID Middleware** -- Assigns `X-Request-Id` to every request

@@ -2,9 +2,9 @@
   "name": "error-workshop-demo",
   "version": "1.0.0",
   "description": "A reference Express API demonstrating production-ready error response patterns.",
-  "main": "server.js",
+  "main": "server.ts",
   "scripts": {
-    "start": "node server.js"
+    "start": "tsx server.ts"
   },
   "keywords": [
     "error-handling",
@@ -14,5 +14,10 @@
   "license": "MIT",
   "dependencies": {
     "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
   }
 }
